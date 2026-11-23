@@ -2463,12 +2463,36 @@ static HRESULT STDMETHODCALLTYPE d3d12_resource_GetPrivateData(d3d12_resource_if
 static HRESULT STDMETHODCALLTYPE d3d12_resource_SetPrivateData(d3d12_resource_iface *iface,
         REFGUID guid, UINT data_size, const void *data)
 {
+    static const GUID xs_address = {0xee1b37d3,0x3bae,0x42b4,{0x85,0xf5,0xd6,0xc4,0xbf,0xdd,0x70,0x9c}};
+    static const GUID xs_texture = {0x9613c207,0x3625,0x48f9,{0x83,0x3b,0x9b,0xd0,0xb2,0x30,0xcd,0xff}};
     struct d3d12_resource *resource = impl_from_ID3D12Resource2(iface);
+    uint64_t va = 0;
+    HRESULT hr;
 
     TRACE("iface %p, guid %s, data_size %u, data %p.\n", iface, debugstr_guid(guid), data_size, data);
-
-    return vkd3d_set_private_data(&resource->private_store, guid, data_size, data,
+    if (IsEqualGUID(guid, &xs_address))
+    {
+        if (!data || data_size != sizeof(va) || resource->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+            resource->initial_state != D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)
+            return E_INVALIDARG;
+        memcpy(&va, data, sizeof(va));
+        if (!va || (va & 255) || va != (resource->res.va & ((UINT64_C(1) << 40) - 1)) ||
+            resource->desc.Width > (UINT64_C(1) << 40) - va)
+            return E_INVALIDARG;
+    }
+    else if (IsEqualGUID(guid, &xs_texture))
+    {
+        if (!data || data_size != sizeof(va) || resource->desc.Dimension < D3D12_RESOURCE_DIMENSION_TEXTURE1D)
+            return E_INVALIDARG;
+        memcpy(&va, data, sizeof(va));
+        if (!va || (va & 15))
+            return E_INVALIDARG;
+    }
+    hr = vkd3d_set_private_data(&resource->private_store, guid, data_size, data,
             (vkd3d_set_name_callback) d3d12_resource_set_name, resource);
+    if (va && SUCCEEDED(hr))
+        vkd3d_atomic_uint64_store_explicit(&resource->frosty_xdxr_va, va, vkd3d_memory_order_relaxed);
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_resource_SetPrivateDataInterface(d3d12_resource_iface *iface,
@@ -2589,15 +2613,63 @@ static bool d3d12_resource_texture_validate_map(struct d3d12_resource *resource)
     return !invalid_map;
 }
 
+/* An XS placed texture may have separate, CPU-visible console-layout storage.
+ * Query its owner, rather than mapping optimal Vulkan image memory. */
+struct xs_texture_mapping;
+struct xs_texture_mapping
+{
+    const struct xs_texture_mapping_vtbl
+    {
+        IUnknownVtbl unknown;
+        HRESULT (STDMETHODCALLTYPE *map)(struct xs_texture_mapping *, ID3D12Resource *, UINT, const D3D12_RANGE *, void **);
+        HRESULT (STDMETHODCALLTYPE *unmap)(struct xs_texture_mapping *, ID3D12Resource *, UINT, const D3D12_RANGE *);
+    } *vtbl;
+};
+
+static struct xs_texture_mapping *d3d12_resource_get_xs_mapping(struct d3d12_resource *resource)
+{
+    static const GUID key = {0xc3982f56,0xf320,0x4d59,{0xbd,0xc9,0x7e,0xcf,0x8b,0x66,0x36,0xec}};
+    struct xs_texture_mapping *mapping = NULL;
+    struct vkd3d_private_data *data;
+    IUnknown *owner = NULL;
+
+    if (!d3d12_resource_is_texture(resource) || FAILED(vkd3d_private_data_lock(&resource->private_store)))
+        return NULL;
+    LIST_FOR_EACH_ENTRY(data, &resource->private_store.content, struct vkd3d_private_data, entry)
+    {
+        if (data->is_object && IsEqualGUID(&data->tag, &key))
+        {
+            owner = data->object;
+            IUnknown_AddRef(owner);
+            break;
+        }
+    }
+    vkd3d_private_data_unlock(&resource->private_store);
+    if (owner)
+    {
+        IUnknown_QueryInterface(owner, &key, (void **)&mapping);
+        IUnknown_Release(owner);
+    }
+    return mapping;
+}
+
 static HRESULT STDMETHODCALLTYPE d3d12_resource_Map(d3d12_resource_iface *iface, UINT sub_resource,
         const D3D12_RANGE *read_range, void **data)
 {
     struct d3d12_resource *resource = impl_from_ID3D12Resource2(iface);
+    struct xs_texture_mapping *mapping;
     unsigned int sub_resource_count;
 
     TRACE("iface %p, sub_resource %u, read_range %p, data %p.\n",
             iface, sub_resource, read_range, data);
 
+    mapping = d3d12_resource_get_xs_mapping(resource);
+    if (mapping)
+    {
+        HRESULT hr = mapping->vtbl->map(mapping, (ID3D12Resource *)iface, sub_resource, read_range, data);
+        IUnknown_Release((IUnknown *)mapping);
+        return hr;
+    }
     if (!d3d12_resource_is_cpu_accessible(resource))
     {
         WARN("Resource is not CPU accessible.\n");
@@ -2639,11 +2711,21 @@ static void STDMETHODCALLTYPE d3d12_resource_Unmap(d3d12_resource_iface *iface, 
         const D3D12_RANGE *written_range)
 {
     struct d3d12_resource *resource = impl_from_ID3D12Resource2(iface);
+    struct xs_texture_mapping *mapping;
     unsigned int sub_resource_count;
 
     TRACE("iface %p, sub_resource %u, written_range %p.\n",
             iface, sub_resource, written_range);
 
+    mapping = d3d12_resource_get_xs_mapping(resource);
+    if (mapping)
+    {
+        HRESULT hr = mapping->vtbl->unmap(mapping, (ID3D12Resource *)iface, sub_resource, written_range);
+        IUnknown_Release((IUnknown *)mapping);
+        if (FAILED(hr))
+            ERR("Failed to publish writes to XS texture, hr %#x.\n", (unsigned int)hr);
+        return;
+    }
     sub_resource_count = d3d12_resource_get_sub_resource_count(resource);
     if (sub_resource >= sub_resource_count)
     {
@@ -2677,10 +2759,11 @@ static D3D12_RESOURCE_DESC * STDMETHODCALLTYPE d3d12_resource_GetDesc(d3d12_reso
 static D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE d3d12_resource_GetGPUVirtualAddress(d3d12_resource_iface *iface)
 {
     struct d3d12_resource *resource = impl_from_ID3D12Resource2(iface);
+    uint64_t va = vkd3d_atomic_uint64_load_explicit(&resource->frosty_xdxr_va, vkd3d_memory_order_relaxed);
 
     TRACE("iface %p, va #%"PRIx64"\n", iface, resource->res.va);
 
-    return resource->res.va;
+    return va ? va : resource->res.va;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_resource_WriteToSubresource(d3d12_resource_iface *iface,

@@ -1226,6 +1226,9 @@ struct d3d12_resource
     /* To keep track of initial layout. */
     VkImageLayout common_layout;
     D3D12_RESOURCE_STATES initial_state;
+    /* Optional guest-visible XS acceleration-structure or texture address.
+     * Internal Vulkan operations continue to use res.va. */
+    uint64_t frosty_xdxr_va;
     uint32_t initial_layout_transition;
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
