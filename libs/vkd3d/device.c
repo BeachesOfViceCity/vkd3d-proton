@@ -72,6 +72,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION_DISABLE_COND(KHR_ACCELERATION_STRUCTURE, KHR_acceleration_structure, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
     VK_EXTENSION_DISABLE_COND(KHR_DEFERRED_HOST_OPERATIONS, KHR_deferred_host_operations, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
     VK_EXTENSION_DISABLE_COND(KHR_RAY_QUERY, KHR_ray_query, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
+    VK_EXTENSION_DISABLE_COND(KHR_RAY_TRACING_POSITION_FETCH, KHR_ray_tracing_position_fetch, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
     VK_EXTENSION_DISABLE_COND(KHR_RAY_TRACING_MAINTENANCE_1, KHR_ray_tracing_maintenance1, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
     VK_EXTENSION(KHR_FRAGMENT_SHADING_RATE, KHR_fragment_shading_rate),
     VK_EXTENSION(KHR_FRAGMENT_SHADER_BARYCENTRIC, KHR_fragment_shader_barycentric),
@@ -1386,6 +1387,11 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
     {
         info->ray_tracing_maintenance1_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR;
         vk_prepend_struct(&info->features2, &info->ray_tracing_maintenance1_features);
+    }
+    if (vulkan_info->KHR_ray_tracing_position_fetch)
+    {
+        info->ray_tracing_position_fetch_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR;
+        vk_prepend_struct(&info->features2, &info->ray_tracing_position_fetch_features);
     }
 
     if (vulkan_info->KHR_fragment_shading_rate)
@@ -3896,6 +3902,8 @@ static void d3d12_device_destroy(struct d3d12_device *device)
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     size_t i, j;
 
+    d3d12_command_pool_resetter_cleanup(device);
+    vkd3d_buffer_supply_cleanup(device);
     d3d_destruction_notifier_free(&device->destruction_notifier);
 
     if (device->internal_sparse_queue)
@@ -10738,6 +10746,8 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
     d3d12_device_reserve_internal_sparse_queue(device);
     d3d_destruction_notifier_init(&device->destruction_notifier, (IUnknown*)&device->ID3D12Device_iface);
     d3d12_device_open_kmt(device);
+    d3d12_command_pool_resetter_init(device);
+    vkd3d_buffer_supply_init(device);
     return S_OK;
 
 out_cleanup_descriptor_qa_global_info:
@@ -11359,6 +11369,16 @@ VkDevice vkd3d_get_vk_device(ID3D12Device *device)
 
     return d3d12_device->vk_device;
 }
+
+#ifdef _WIN32
+/* Standalone prewarm tools must be able to verify that serialization
+ * finished without depending on implicit device/process destruction. */
+HRESULT WINAPI VKD3DCommitPipelineCache(ID3D12Device *iface)
+{
+    struct d3d12_device *device = impl_from_ID3D12Device((d3d12_device_iface *)iface);
+    return device ? vkd3d_pipeline_library_commit_disk_cache(&device->disk_cache) : E_INVALIDARG;
+}
+#endif
 
 VkPhysicalDevice vkd3d_get_vk_physical_device(ID3D12Device *device)
 {

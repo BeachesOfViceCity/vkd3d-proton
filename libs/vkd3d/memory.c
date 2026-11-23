@@ -1966,9 +1966,12 @@ static void vkd3d_memory_allocator_remove_chunk(struct vkd3d_memory_allocator *a
 
 HRESULT vkd3d_memory_allocator_init(struct vkd3d_memory_allocator *allocator, struct d3d12_device *device)
 {
+    char value[8];
     int rc;
 
     memset(allocator, 0, sizeof(*allocator));
+    allocator->keep_empty_buffers = vkd3d_get_env_var("FROSTY_KEEP_BUFFER_CHUNKS", value, sizeof(value)) && !strcmp(value, "1");
+    allocator->report_empty_buffers = allocator->keep_empty_buffers && vkd3d_get_env_var("FROSTY_POOL_STATS", value, sizeof(value)) && !strcmp(value, "1");
 
     if ((rc = pthread_mutex_init(&allocator->mutex, NULL)))
         return hresult_from_errno(rc);
@@ -2085,7 +2088,16 @@ static HRESULT vkd3d_memory_allocator_try_suballocate_memory(struct vkd3d_memory
             continue;
 
         if (SUCCEEDED(hr = vkd3d_memory_chunk_allocate_range(chunk, memory_requirements, allocation)))
+        {
+            if (chunk->warm_idle)
+            {
+                chunk->warm_idle = false;
+                allocator->idle_buffer_bytes -= chunk->allocation.resource.size;
+                if (allocator->report_empty_buffers && !(allocator->reused_empty_buffers++ % 128))
+                    INFO("Frosty empty buffer chunks: %"PRIu64" reuses.\n", allocator->reused_empty_buffers);
+            }
             return hr;
+        }
     }
 
     /* Try allocating a new chunk on one of the supported memory type
@@ -2113,7 +2125,20 @@ void vkd3d_free_memory(struct d3d12_device *device, struct vkd3d_memory_allocato
         vkd3d_memory_chunk_free_range(allocation->chunk, allocation);
 
         if (vkd3d_memory_chunk_is_free(allocation->chunk))
-            vkd3d_memory_allocator_remove_chunk(allocator, device, allocation->chunk);
+        {
+            struct vkd3d_memory_chunk *chunk = allocation->chunk;
+            /* Normal suballocation clears still run, including on the first
+             * new borrower. Only retain the backing and its registered VA. */
+            if (allocator->keep_empty_buffers && chunk->allocation.heap_type == D3D12_HEAP_TYPE_DEFAULT &&
+                    (chunk->allocation.flags & VKD3D_ALLOCATION_FLAG_GPU_ADDRESS) &&
+                    chunk->allocation.resource.size <= (64ull << 20) - allocator->idle_buffer_bytes)
+            {
+                chunk->warm_idle = true;
+                allocator->idle_buffer_bytes += chunk->allocation.resource.size;
+            }
+            else
+                vkd3d_memory_allocator_remove_chunk(allocator, device, chunk);
+        }
         pthread_mutex_unlock(&allocator->mutex);
     }
     else
@@ -2247,6 +2272,7 @@ HRESULT vkd3d_allocate_memory(struct d3d12_device *device, struct vkd3d_memory_a
     bool implementation_can_zero_clear_alloc;
     bool needs_command_clear;
     bool suballocate;
+    bool tried_trim = false;
     HRESULT hr;
 
     suballocate = vkd3d_memory_info_allow_suballocate(device, info);
@@ -2275,11 +2301,29 @@ HRESULT vkd3d_allocate_memory(struct d3d12_device *device, struct vkd3d_memory_a
         info = &tmp_info;
     }
 
+retry:
     if (suballocate)
         hr = vkd3d_suballocate_memory(device, allocator, info, allocation);
     else
         hr = vkd3d_memory_allocation_init(allocation, device, allocator, info);
 
+    if (hr == E_OUTOFMEMORY && allocator->keep_empty_buffers && !tried_trim)
+    {
+        size_t i;
+        bool evicted = false;
+        tried_trim = true;
+        pthread_mutex_lock(&allocator->mutex);
+        for (i = allocator->chunks_count; i--;)
+        {
+            struct vkd3d_memory_chunk *chunk = allocator->chunks[i];
+            if (!chunk->warm_idle) continue;
+            allocator->idle_buffer_bytes -= chunk->allocation.resource.size;
+            vkd3d_memory_allocator_remove_chunk(allocator, device, chunk);
+            evicted = true;
+        }
+        pthread_mutex_unlock(&allocator->mutex);
+        if (evicted) goto retry;
+    }
     if (FAILED(hr))
         return hr;
 
@@ -2299,6 +2343,131 @@ HRESULT vkd3d_allocate_memory(struct d3d12_device *device, struct vkd3d_memory_a
         }
     }
 
+    return hr;
+}
+
+static void *vkd3d_buffer_supply_worker(void *arg)
+{
+    struct d3d12_device *device = arg;
+    struct vkd3d_buffer_supply *s = &device->buffer_supply;
+    struct vkd3d_memory_allocation allocation;
+    unsigned int n, i;
+    HRESULT hr;
+    vkd3d_set_thread_name("vkd3d_bufsupply");
+    pthread_mutex_lock(&s->lock);
+    while (!s->stop)
+    {
+        for (n = 0; n < ARRAY_SIZE(s->bins); ++n)
+        {
+            i = (s->cursor + n) % ARRAY_SIZE(s->bins);
+            if (s->bins[i].seen >= 2 && !s->bins[i].failed && s->bins[i].count < ARRAY_SIZE(s->bins[i].slots) &&
+                    s->bins[i].info.heap_desc.SizeInBytes <= (48ull << 20) - s->bytes)
+                break;
+        }
+        if (n == ARRAY_SIZE(s->bins))
+        {
+            pthread_cond_wait(&s->wake, &s->lock);
+            continue;
+        }
+        s->cursor = (i + 1) % ARRAY_SIZE(s->bins);
+        s->bytes += s->bins[i].info.heap_desc.SizeInBytes;
+        pthread_mutex_unlock(&s->lock);
+        hr = vkd3d_allocate_heap_memory(device, &device->memory_allocator, &s->bins[i].info, &allocation);
+        if (SUCCEEDED(hr) && !allocation.chunk)
+        {
+            /* Dedicated allocation VA maps point at the allocation record. */
+            vkd3d_free_memory(device, &device->memory_allocator, &allocation);
+            hr = E_FAIL;
+        }
+        pthread_mutex_lock(&s->lock);
+        if (FAILED(hr))
+        {
+            s->bins[i].failed = true;
+            s->bytes -= s->bins[i].info.heap_desc.SizeInBytes;
+        }
+        else
+            s->bins[i].slots[s->bins[i].count++] = allocation;
+    }
+    pthread_mutex_unlock(&s->lock);
+    return NULL;
+}
+
+void vkd3d_buffer_supply_init(struct d3d12_device *device)
+{
+    struct vkd3d_buffer_supply *s = &device->buffer_supply;
+    char value[8];
+    if (!vkd3d_get_env_var("FROSTY_BUFFER_SUPPLY", value, sizeof(value)) || strcmp(value, "1")) return;
+    s->report = vkd3d_get_env_var("FROSTY_POOL_STATS", value, sizeof(value)) && !strcmp(value, "1");
+    if (pthread_mutex_init(&s->lock, NULL)) return;
+    if (!pthread_cond_init(&s->wake, NULL))
+    {
+        if (!pthread_create(&s->thread, NULL, vkd3d_buffer_supply_worker, device))
+        {
+            s->enabled = true;
+            return;
+        }
+        pthread_cond_destroy(&s->wake);
+    }
+    pthread_mutex_destroy(&s->lock);
+}
+
+void vkd3d_buffer_supply_cleanup(struct d3d12_device *device)
+{
+    struct vkd3d_buffer_supply *s = &device->buffer_supply;
+    unsigned int i;
+    if (!s->enabled) return;
+    pthread_mutex_lock(&s->lock);
+    s->stop = true;
+    pthread_cond_signal(&s->wake);
+    pthread_mutex_unlock(&s->lock);
+    pthread_join(s->thread, NULL);
+    for (i = 0; i < ARRAY_SIZE(s->bins); ++i)
+        while (s->bins[i].count)
+            vkd3d_free_memory(device, &device->memory_allocator, &s->bins[i].slots[--s->bins[i].count]);
+    pthread_cond_destroy(&s->wake);
+    pthread_mutex_destroy(&s->lock);
+}
+
+HRESULT vkd3d_allocate_committed_buffer_backing(struct d3d12_device *device,
+        const struct vkd3d_allocate_heap_memory_info *info, struct vkd3d_memory_allocation *allocation)
+{
+    struct vkd3d_buffer_supply *s = &device->buffer_supply;
+    VkDeviceSize size = info->heap_desc.SizeInBytes;
+    unsigned int i;
+    HRESULT hr;
+    if (!s->enabled || info->host_ptr || info->extra_allocation_flags || info->explicit_global_buffer_usage ||
+            info->heap_desc.Properties.Type != D3D12_HEAP_TYPE_DEFAULT ||
+            info->heap_desc.Flags != D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS ||
+            info->heap_desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT ||
+            size < (256u << 10) || size >= VKD3D_VA_BLOCK_SIZE || size % D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+        return vkd3d_allocate_heap_memory(device, &device->memory_allocator, info, allocation);
+    i = size / D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    if (i >= ARRAY_SIZE(s->bins))
+        return vkd3d_allocate_heap_memory(device, &device->memory_allocator, info, allocation);
+
+    pthread_mutex_lock(&s->lock);
+    if (s->bins[i].count && !memcmp(&s->bins[i].info, info, sizeof(*info)))
+    {
+        *allocation = s->bins[i].slots[--s->bins[i].count];
+        s->bytes -= size;
+        if (s->report && !(s->hits++ % 512))
+            INFO("Frosty prepared buffer backing: %"PRIu64" hits, %"PRIu64" misses, %"PRIu64" reserved bytes.\n",
+                    s->hits, s->misses, s->bytes);
+        pthread_cond_signal(&s->wake);
+        pthread_mutex_unlock(&s->lock);
+        return S_OK;
+    }
+    pthread_mutex_unlock(&s->lock);
+    hr = vkd3d_allocate_heap_memory(device, &device->memory_allocator, info, allocation);
+    if (SUCCEEDED(hr) && allocation->chunk)
+    {
+        pthread_mutex_lock(&s->lock);
+        ++s->misses;
+        if (!s->bins[i].seen) s->bins[i].info = *info;
+        if (!memcmp(&s->bins[i].info, info, sizeof(*info)) && s->bins[i].seen < 2 && ++s->bins[i].seen == 2)
+            pthread_cond_signal(&s->wake);
+        pthread_mutex_unlock(&s->lock);
+    }
     return hr;
 }
 

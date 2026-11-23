@@ -24,6 +24,7 @@
 #include "vkd3d_rw_spinlock.h"
 #include "vkd3d_timestamp_profiler.h"
 #include <stdio.h>
+#include "frosty_stage_cache.h"
 
 /* ID3D12RootSignature */
 static HRESULT STDMETHODCALLTYPE d3d12_root_signature_QueryInterface(ID3D12RootSignature *iface,
@@ -77,6 +78,7 @@ static void d3d12_root_signature_cleanup(struct d3d12_root_signature *root_signa
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
 
+    frosty_stage_forget_root(root_signature);
     vkd3d_sampler_state_free_descriptor_set(&device->sampler_state, device,
             root_signature->vk_sampler_set, root_signature->vk_sampler_pool);
 
@@ -3321,11 +3323,52 @@ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, st
                 device->descriptor_qa_global_info, dxbc.code, dxbc.size);
         d3d12_pipeline_state_init_compile_arguments(state, device, stage, &compile_args);
 
-        if ((ret = vkd3d_shader_compile_dxbc(&dxbc, spirv_code, spirv_code_debug,
-                0, &shader_interface, &compile_args)) < 0)
         {
-            WARN("Failed to compile shader, vkd3d result %d.\n", ret);
-            return hresult_from_vkd3d_result(ret);
+            struct frosty_stage_key cache_key;
+            bool cacheable = frosty_stage_key_init(&cache_key, state, &dxbc, &shader_interface,
+                    &compile_args, spirv_code_debug != NULL);
+            bool hit = cacheable && frosty_stage_get(&cache_key, state->root_signature, &dxbc,
+                    spirv_code, spirv_code_debug);
+            uint64_t start = frosty_flag("FROSTY_STAGE_TIMES") ? vkd3d_get_current_time_ns() : 0;
+            bool disk_hit = false;
+#ifdef _WIN32
+            struct frosty_disk_id disk;
+            bool use_disk = cacheable && !hit && frosty_disk_key(&disk, &cache_key, state->root_signature, &dxbc);
+            disk_hit = use_disk && frosty_disk_get(&disk, spirv_code, spirv_code_debug);
+            if (disk_hit) frosty_stage_put(&cache_key, state->root_signature, &dxbc, spirv_code, spirv_code_debug);
+#endif
+            if ((hit || disk_hit) && frosty_flag("FROSTY_VERIFY_STAGES"))
+            {
+                struct vkd3d_shader_code verify = {0};
+                struct vkd3d_shader_code_debug dbg = {0};
+                bool match = vkd3d_shader_compile_dxbc(&dxbc, &verify, spirv_code_debug ? &dbg : NULL,
+                        0, &shader_interface, &compile_args) >= 0 && verify.size == spirv_code->size &&
+                        !memcmp(&verify.meta, &spirv_code->meta, sizeof(verify.meta)) &&
+                        !memcmp(verify.code, spirv_code->code, verify.size) &&
+                        (!spirv_code_debug || !strcmp(dbg.debug_entry_point_name ? dbg.debug_entry_point_name : "",
+                        spirv_code_debug->debug_entry_point_name ? spirv_code_debug->debug_entry_point_name : ""));
+                INFO("Frosty stage replay byte comparison: %s.\n", match ? "matched" : "MISMATCH");
+                vkd3d_shader_free_shader_code(&verify);
+                vkd3d_shader_free_shader_code_debug(&dbg);
+                if (!match) return E_FAIL;
+            }
+            if (!hit && !disk_hit)
+            {
+                if ((ret = vkd3d_shader_compile_dxbc(&dxbc, spirv_code, spirv_code_debug,
+                        0, &shader_interface, &compile_args)) < 0)
+                {
+                    WARN("Failed to compile shader, vkd3d result %d.\n", ret);
+                    return hresult_from_vkd3d_result(ret);
+                }
+                if (cacheable)
+                    frosty_stage_put(&cache_key, state->root_signature, &dxbc, spirv_code, spirv_code_debug);
+#ifdef _WIN32
+                if (use_disk) frosty_disk_put(&disk, spirv_code, spirv_code_debug);
+#endif
+            }
+            if (start)
+                INFO("Frosty stage %x %s (%s), %.3f ms, %zu SPIR-V bytes.\n", stage, disk_hit ? "disk" : hit ? "hit" : "compiled",
+                        cacheable ? "cacheable" : "direct", (vkd3d_get_current_time_ns() - start) * 1e-6, spirv_code->size);
         }
         TRACE("Called vkd3d_shader_compile_dxbc.\n");
 
@@ -6766,6 +6809,104 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
     return vr;
 }
 
+/* Keep an exact vertex program reusable across newly streamed fragment
+ * programs, and conversely. The source stage infos carry the original
+ * specialization constants, subgroup size, entry point and root layout. */
+static VkResult d3d12_frosty_graphics_pipeline(struct d3d12_device *device, VkPipelineCache cache,
+        const VkGraphicsPipelineCreateInfo *full, const VkPipelineRenderingCreateInfo *rendering,
+        VkPipelineCreateFlags2 flags, bool allow_split, VkPipeline *pipeline)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    VkPipeline libs[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkPipelineRenderingCreateInfo formats;
+    VkGraphicsPipelineLibraryCreateInfoEXT group;
+    VkPipelineCreateFlags2CreateInfo f;
+    VkGraphicsPipelineCreateInfo ci;
+    VkPipelineLibraryCreateInfoKHR link;
+    unsigned int frag, i;
+    static LONG reported;
+    char env[8];
+    VkResult vr;
+
+    if (!allow_split || full->stageCount != 2 ||
+            !device->device_info.graphics_pipeline_library_features.graphicsPipelineLibrary ||
+            !device->device_info.graphics_pipeline_library_properties.graphicsPipelineLibraryFastLinking ||
+            !vkd3d_get_env_var("FROSTY_FAST_GPL", env, sizeof(env)) || strcmp(env, "1"))
+        goto ordinary;
+    frag = full->pStages[0].stage == VK_SHADER_STAGE_FRAGMENT_BIT ? 0 : 1;
+    if (full->pStages[frag].stage != VK_SHADER_STAGE_FRAGMENT_BIT ||
+            full->pStages[1 - frag].stage != VK_SHADER_STAGE_VERTEX_BIT)
+        goto ordinary;
+
+    /* Prefer an already optimized monolithic pipeline. Do not block for
+     * that optimization before trying a driver-supported fast link. */
+    if (device->device_info.vulkan_1_3_features.pipelineCreationCacheControl)
+    {
+        f = (VkPipelineCreateFlags2CreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
+            .pNext = rendering, .flags = flags | VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT};
+        ci = *full;
+        ci.pNext = &f;
+        vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, cache, 1, &ci, NULL, pipeline));
+        if (vr != VK_PIPELINE_COMPILE_REQUIRED)
+            return vr;
+    }
+    for (i = 0; i < ARRAY_SIZE(libs); ++i)
+    {
+        formats = *rendering;
+        group = (VkGraphicsPipelineLibraryCreateInfoEXT){.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+            .pNext = &formats, .flags = i ? VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT |
+            VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT : VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT |
+            VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT};
+        f = (VkPipelineCreateFlags2CreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
+            .pNext = &group, .flags = flags | VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR};
+        ci = *full;
+        ci.pNext = &f;
+        ci.stageCount = 1;
+        ci.pStages = &full->pStages[i ? frag : 1 - frag];
+        if (!i)
+        {
+            /* Only viewMask belongs to pre-rasterization state. */
+            formats.colorAttachmentCount = 0;
+            formats.pColorAttachmentFormats = NULL;
+            formats.depthAttachmentFormat = formats.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
+            ci.pColorBlendState = NULL;
+            ci.pDepthStencilState = NULL;
+            ci.pMultisampleState = NULL;
+        }
+        else
+        {
+            ci.pVertexInputState = NULL;
+            ci.pInputAssemblyState = NULL;
+            ci.pViewportState = NULL;
+            ci.pRasterizationState = NULL;
+        }
+        vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, cache, 1, &ci, NULL, &libs[i]));
+        if (vr != VK_SUCCESS)
+            goto release;
+    }
+    link = (VkPipelineLibraryCreateInfoKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
+        .libraryCount = ARRAY_SIZE(libs), .pLibraries = libs};
+    f = (VkPipelineCreateFlags2CreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
+        .pNext = &link, .flags = flags};
+    ci = (VkGraphicsPipelineCreateInfo){.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .pNext = &f, .layout = full->layout, .basePipelineIndex = -1};
+    vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, cache, 1, &ci, NULL, pipeline));
+release:
+    for (i = 0; i < ARRAY_SIZE(libs); ++i)
+        if (libs[i])
+            VK_CALL(vkDestroyPipeline(device->vk_device, libs[i], NULL));
+    if (vr == VK_SUCCESS)
+    {
+        if (!InterlockedCompareExchange(&reported, 1, 0))
+            INFO("Fast-linked separate vertex and fragment pipelines.\n");
+        return vr;
+    }
+    if (vr == VK_PIPELINE_COMPILE_REQUIRED)
+        return vr;
+ordinary:
+    return VK_CALL(vkCreateGraphicsPipelines(device->vk_device, cache, 1, full, NULL, pipeline));
+}
+
 VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_state *state,
         const struct vkd3d_pipeline_key *key, const struct vkd3d_format *dsv_format, VkPipelineCache vk_cache,
         VkGraphicsPipelineLibraryFlagsEXT library_flags, uint32_t *dynamic_state_flags)
@@ -6958,7 +7099,9 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     if (flags2.flags)
         vk_prepend_struct(&pipeline_desc, &flags2);
 
-    vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline));
+    vr = d3d12_frosty_graphics_pipeline(device, vk_cache, &pipeline_desc, &fragment_output_desc.rt_info,
+            flags2.flags, !key && !library_flags && !graphics->library && !graphics->multiview.dynamic_mask &&
+            !VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_LOG), &vk_pipeline);
 
     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
     {
@@ -7008,7 +7151,9 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
         pipeline_desc.pStages = state->graphics.stages;
 
         cookie = vkd3d_queue_timeline_trace_register_pso_compile(&device->queue_timeline_trace);
-        vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline));
+        vr = d3d12_frosty_graphics_pipeline(device, vk_cache, &pipeline_desc, &fragment_output_desc.rt_info,
+                flags2.flags, !key && !library_flags && !graphics->library && !graphics->multiview.dynamic_mask &&
+                !VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_LOG), &vk_pipeline);
 
         if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
         {

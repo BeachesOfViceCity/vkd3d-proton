@@ -2515,13 +2515,15 @@ static HRESULT d3d12_command_allocator_reset_command_pool(
         return S_OK;
 
     /* Just keep reusing the command buffers without allocate/free pairs. */
-    vkd3d_array_reserve((void **)&pool->recycled.command_buffers, &pool->recycled.command_buffers_size,
+    if (!vkd3d_array_reserve((void **)&pool->recycled.command_buffers, &pool->recycled.command_buffers_size,
             pool->recycled.command_buffer_count + pool->pending.command_buffer_count,
-            sizeof(*pool->recycled.command_buffers));
+            sizeof(*pool->recycled.command_buffers)))
+        return E_OUTOFMEMORY;
 
-    memcpy(pool->recycled.command_buffers + pool->recycled.command_buffer_count,
-            pool->pending.command_buffers,
-            pool->pending.command_buffer_count * sizeof(*pool->pending.command_buffers));
+    if (pool->pending.command_buffer_count)
+        memcpy(pool->recycled.command_buffers + pool->recycled.command_buffer_count,
+                pool->pending.command_buffers,
+                pool->pending.command_buffer_count * sizeof(*pool->pending.command_buffers));
 
     pool->recycled.command_buffer_count += pool->pending.command_buffer_count;
     pool->pending.command_buffer_count = 0;
@@ -2762,6 +2764,137 @@ static void d3d12_command_allocator_free_command_pool(
     VK_CALL(vkDestroyCommandPool(device->vk_device, pool->vk_command_pool, NULL));
 }
 
+static void *d3d12_command_pool_reset_worker(void *arg)
+{
+    struct d3d12_device *device = arg;
+    struct d3d12_command_pool_resetter *r = &device->pool_resetter;
+    struct d3d12_command_allocator_command_pool *pool;
+    unsigned int i, n;
+    HRESULT hr;
+
+    vkd3d_set_thread_name("vkd3d_poolreset");
+    pthread_mutex_lock(&r->lock);
+    for (;;)
+    {
+        for (n = 0; n < ARRAY_SIZE(r->slots); ++n)
+        {
+            i = (r->cursor + n) % ARRAY_SIZE(r->slots);
+            if (r->slots[i].state == POOL_QUEUED)
+                break;
+        }
+        if (n == ARRAY_SIZE(r->slots))
+        {
+            if (r->stop) break;
+            pthread_cond_wait(&r->wake, &r->lock);
+            continue;
+        }
+        r->cursor = (i + 1) % ARRAY_SIZE(r->slots);
+        r->slots[i].state = POOL_RESETTING;
+        pool = &r->slots[i].pool;
+        pthread_mutex_unlock(&r->lock);
+        hr = d3d12_command_allocator_reset_command_pool(device, pool);
+        if (FAILED(hr))
+        {
+            d3d12_command_allocator_free_command_pool(pool, device);
+            if (hr == DXGI_ERROR_DEVICE_REMOVED)
+                d3d12_device_mark_as_removed(device, hr, "Command pool reset failed.\n");
+        }
+        pthread_mutex_lock(&r->lock);
+        r->slots[i].state = SUCCEEDED(hr) ? POOL_READY : POOL_EMPTY;
+    }
+    pthread_mutex_unlock(&r->lock);
+    return NULL;
+}
+
+void d3d12_command_pool_resetter_init(struct d3d12_device *device)
+{
+    struct d3d12_command_pool_resetter *r = &device->pool_resetter;
+    char value[8];
+    if (!vkd3d_get_env_var("FROSTY_ASYNC_POOL_RESET", value, sizeof(value)) || strcmp(value, "1"))
+        return;
+    r->report = vkd3d_get_env_var("FROSTY_POOL_STATS", value, sizeof(value)) && !strcmp(value, "1");
+    if (pthread_mutex_init(&r->lock, NULL)) return;
+    if (!pthread_cond_init(&r->wake, NULL))
+    {
+        if (!pthread_create(&r->thread, NULL, d3d12_command_pool_reset_worker, device))
+        {
+            r->enabled = true;
+            return;
+        }
+        pthread_cond_destroy(&r->wake);
+    }
+    pthread_mutex_destroy(&r->lock);
+}
+
+void d3d12_command_pool_resetter_cleanup(struct d3d12_device *device)
+{
+    struct d3d12_command_pool_resetter *r = &device->pool_resetter;
+    unsigned int i;
+    if (!r->enabled) return;
+    pthread_mutex_lock(&r->lock);
+    r->stop = true;
+    pthread_cond_signal(&r->wake);
+    pthread_mutex_unlock(&r->lock);
+    pthread_join(r->thread, NULL);
+    for (i = 0; i < ARRAY_SIZE(r->slots); ++i)
+        if (r->slots[i].state == POOL_READY)
+            d3d12_command_allocator_free_command_pool(&r->slots[i].pool, device);
+    pthread_cond_destroy(&r->wake);
+    pthread_mutex_destroy(&r->lock);
+}
+
+/* Close returned the old command buffers to pending, and Reset has checked
+ * recording state and outstanding submissions. Transfer both handle arrays
+ * with their pool. An independent clean pool is ready for the caller. */
+static bool d3d12_command_allocator_exchange_pool(struct d3d12_device *device,
+        struct d3d12_command_allocator_command_pool *pool)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    struct d3d12_command_pool_resetter *r = &device->pool_resetter;
+    struct d3d12_command_allocator_command_pool fresh = {0};
+    unsigned int i, empty = ARRAY_SIZE(r->slots);
+    VkCommandPoolCreateInfo info = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    if (!r->enabled || !pool->pending.command_buffer_count)
+        return false;
+    pthread_mutex_lock(&r->lock);
+    for (i = 0; i < ARRAY_SIZE(r->slots); ++i)
+    {
+        if (r->slots[i].state == POOL_READY && r->slots[i].pool.vk_family_index == pool->vk_family_index &&
+                r->slots[i].pool.vk_queue_flags == pool->vk_queue_flags)
+        {
+            fresh = r->slots[i].pool;
+            break;
+        }
+        if (r->slots[i].state == POOL_EMPTY)
+            empty = i;
+    }
+    if (i == ARRAY_SIZE(r->slots))
+    {
+        if (empty == ARRAY_SIZE(r->slots))
+        {
+            pthread_mutex_unlock(&r->lock);
+            return false;
+        }
+        i = empty;
+        info.queueFamilyIndex = fresh.vk_family_index = pool->vk_family_index;
+        fresh.vk_queue_flags = pool->vk_queue_flags;
+        if (VK_CALL(vkCreateCommandPool(device->vk_device, &info, NULL, &fresh.vk_command_pool)) != VK_SUCCESS)
+        {
+            pthread_mutex_unlock(&r->lock);
+            return false;
+        }
+        ++r->fresh;
+    }
+    r->slots[i].state = POOL_QUEUED;
+    r->slots[i].pool = *pool;
+    *pool = fresh;
+    if (r->report && !(r->exchanges++ % 8192))
+        INFO("Frosty retired command pools: %"PRIu64" exchanges, %"PRIu64" fresh.\n", r->exchanges, r->fresh);
+    pthread_cond_signal(&r->wake);
+    pthread_mutex_unlock(&r->lock);
+    return true;
+}
+
 static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *allocator)
 {
     unsigned int i, j;
@@ -2970,7 +3103,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_allocator_Reset(ID3D12CommandAllo
             VKD3D_QUEUE_TIMELINE_TRACE_STATE_TYPE_COMMAND_ALLOCATOR_RESET,
             allocator->primary_pool.pending.command_buffer_count);
 
-    if (FAILED(hr = d3d12_command_allocator_reset_command_pool(device, &allocator->primary_pool)))
+    if ((allocator->current_command_list || !d3d12_command_allocator_exchange_pool(device, &allocator->primary_pool)) &&
+            FAILED(hr = d3d12_command_allocator_reset_command_pool(device, &allocator->primary_pool)))
         return hr;
     if (FAILED(hr = d3d12_command_allocator_reset_command_pool(device, &allocator->fallback_pool)))
         return hr;

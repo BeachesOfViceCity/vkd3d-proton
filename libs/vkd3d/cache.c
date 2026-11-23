@@ -2865,6 +2865,23 @@ HRESULT vkd3d_pipeline_library_store_pipeline_to_disk_cache(
         struct vkd3d_pipeline_library_disk_cache *cache,
         struct d3d12_pipeline_state *state)
 {
+    struct vkd3d_pipeline_library_disk_cache_item item = { state };
+    HRESULT hr;
+
+    if (cache->synchronous_writer)
+    {
+        pthread_mutex_lock(&cache->lock);
+        hr = vkd3d_pipeline_library_disk_cache_save_pipeline_state(cache, &item);
+        if (FAILED(hr) && hr != E_INVALIDARG)
+            cache->write_failed = true;
+        /* The standalone baker can restart after a stalled or interrupted
+         * recipe. Preserve all entries it has already completed. */
+        if (cache->stream_archive_write_file && fflush(cache->stream_archive_write_file))
+            cache->write_failed = true;
+        pthread_mutex_unlock(&cache->lock);
+        return hr == E_INVALIDARG ? S_OK : hr;
+    }
+
     /* Push new work to disk cache thread. */
     d3d12_pipeline_state_inc_ref(state);
     pthread_mutex_lock(&cache->lock);
@@ -3213,6 +3230,7 @@ HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_dis
     const char *app_name_str = NULL;
     char path_buf[VKD3D_PATH_MAX];
     char app_name[VKD3D_PATH_MAX];
+    char synchronous[8];
     VKD3D_UNUSED size_t i, n;
     const char *separator;
     const char *path;
@@ -3224,6 +3242,9 @@ HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_dis
 
     if (VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_APP_CACHE_ONLY))
         return S_OK;
+
+    cache->synchronous_writer = vkd3d_get_env_var("VKD3D_SHADER_CACHE_WRITE_SYNC", synchronous, sizeof(synchronous))
+            && !strcmp(synchronous, "1");
 
     /* Match DXVK style here. The environment variable is a directory.
      * If not set, it is in current working directory. */
@@ -3286,7 +3307,7 @@ HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_dis
     flags = VKD3D_PIPELINE_LIBRARY_FLAG_INTERNAL_KEYS | VKD3D_PIPELINE_LIBRARY_FLAG_STREAM_ARCHIVE;
 
     /* This flag is mostly for debug. Normally we want to do shader cache management in disk thread. */
-    if (!VKD3D_CONFIG_FLAG_IS_SET(SHADER_CACHE_SYNC))
+    if (!cache->synchronous_writer && !VKD3D_CONFIG_FLAG_IS_SET(SHADER_CACHE_SYNC))
         flags |= VKD3D_PIPELINE_LIBRARY_FLAG_STREAM_ARCHIVE_PARSE_ASYNC;
 
     if (device->device_info.shader_module_identifier_features.shaderModuleIdentifier)
@@ -3309,9 +3330,11 @@ HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_dis
         if (!(flags & VKD3D_PIPELINE_LIBRARY_FLAG_STREAM_ARCHIVE_PARSE_ASYNC))
             vkd3d_pipeline_library_disk_cache_initial_setup(cache);
 
-        cache->thread_active = true;
-        if ((rc = pthread_mutex_init(&cache->lock, NULL)) < 0)
+        if ((rc = pthread_mutex_init(&cache->lock, NULL)))
             goto mutex_fail;
+        if (cache->synchronous_writer)
+            return hr;
+        cache->thread_active = true;
         if ((rc = condvar_reltime_init(&cache->cond)) < 0)
             goto cond_fail;
         if ((rc = pthread_create(&cache->thread, NULL, vkd3d_pipeline_library_disk_thread_main, cache)) < 0)
@@ -3325,11 +3348,30 @@ thread_fail:
 cond_fail:
     pthread_mutex_destroy(&cache->lock);
 mutex_fail:
-    ERR("Failed to start pipeline library disk thread.\n");
+    ERR("Failed to initialize pipeline library disk writer, rc %d.\n", rc);
     if (cache->library)
         d3d12_pipeline_library_dec_ref(cache->library);
     cache->library = NULL;
     cache->thread_active = false;
+    return hr;
+}
+
+HRESULT vkd3d_pipeline_library_commit_disk_cache(struct vkd3d_pipeline_library_disk_cache *cache)
+{
+    HRESULT hr;
+
+    if (!cache->library || !cache->synchronous_writer)
+        return E_NOTIMPL;
+
+    pthread_mutex_lock(&cache->lock);
+    if (cache->stream_archive_write_file)
+    {
+        if (fclose(cache->stream_archive_write_file))
+            cache->write_failed = true;
+        cache->stream_archive_write_file = NULL;
+    }
+    hr = cache->write_failed ? E_FAIL : S_OK;
+    pthread_mutex_unlock(&cache->lock);
     return hr;
 }
 
@@ -3343,7 +3385,12 @@ void vkd3d_pipeline_library_flush_disk_cache(struct vkd3d_pipeline_library_disk_
                 vkd3d_memory_order_relaxed);
     }
 
-    if (cache->thread_active)
+    if (cache->synchronous_writer && cache->library)
+    {
+        vkd3d_pipeline_library_commit_disk_cache(cache);
+        pthread_mutex_destroy(&cache->lock);
+    }
+    else if (cache->thread_active)
     {
         pthread_mutex_lock(&cache->lock);
         cache->thread_active = false;
@@ -3373,7 +3420,7 @@ void vkd3d_pipeline_library_disk_cache_notify_blob_insert(struct vkd3d_pipeline_
         uint64_t hash, uint32_t type /* vkd3d_serialized_pipeline_stream_entry_type */,
         const void *data, size_t size)
 {
-    /* Always called from disk$ thread, so we don't have to consider thread safety. */
+    /* Called either by disk$ or with the synchronous writer lock held. */
     struct vkd3d_serialized_pipeline_library_stream header;
     struct vkd3d_serialized_pipeline_stream_entry entry;
     uint8_t zero_array[VKD3D_PIPELINE_BLOB_ALIGN];
@@ -3392,12 +3439,16 @@ void vkd3d_pipeline_library_disk_cache_notify_blob_insert(struct vkd3d_pipeline_
             if (fwrite(&header, sizeof(header), 1, disk_cache->stream_archive_write_file) != 1)
             {
                 ERR("Failed to write stream archive header.\n");
+                disk_cache->write_failed = true;
                 fclose(disk_cache->stream_archive_write_file);
                 disk_cache->stream_archive_write_file = NULL;
             }
         }
         else
+        {
             ERR("Failed to open stream archive write file exclusively: %s.\n", disk_cache->write_path);
+            disk_cache->write_failed = true;
+        }
     }
 
     if (disk_cache->stream_archive_write_file)
@@ -3408,9 +3459,15 @@ void vkd3d_pipeline_library_disk_cache_notify_blob_insert(struct vkd3d_pipeline_
         entry.checksum = vkd3d_serialized_pipeline_stream_entry_compute_checksum(data, &entry);
 
         if (fwrite(&entry, sizeof(entry), 1, disk_cache->stream_archive_write_file) != 1)
+        {
             ERR("Failed to write entry header.\n");
+            disk_cache->write_failed = true;
+        }
         if (fwrite(data, 1, size, disk_cache->stream_archive_write_file) != size)
+        {
             ERR("Failed to write blob data.\n");
+            disk_cache->write_failed = true;
+        }
 
         /* Write padding data. */
         padding_size = align(size, VKD3D_PIPELINE_BLOB_ALIGN) - size;
@@ -3418,7 +3475,10 @@ void vkd3d_pipeline_library_disk_cache_notify_blob_insert(struct vkd3d_pipeline_
         {
             memset(zero_array, 0, padding_size);
             if (fwrite(zero_array, 1, padding_size, disk_cache->stream_archive_write_file) != padding_size)
+            {
                 ERR("Failed to write padding.\n");
+                disk_cache->write_failed = true;
+            }
         }
 
         /* Defer fflush until things quiet down. No need to spam fflush 1000s of times per second. */

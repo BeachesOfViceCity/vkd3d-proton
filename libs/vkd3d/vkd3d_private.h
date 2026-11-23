@@ -134,6 +134,7 @@ struct vkd3d_vulkan_info
     bool KHR_ray_query;
     bool KHR_fragment_shading_rate;
     bool KHR_ray_tracing_maintenance1;
+    bool KHR_ray_tracing_position_fetch;
     bool KHR_fragment_shader_barycentric;
     bool KHR_external_memory_win32;
     bool KHR_external_semaphore_win32;
@@ -911,9 +912,34 @@ struct vkd3d_memory_free_range
     VkDeviceSize length;
 };
 
+/* Exact, not-yet-issued slices of regular committed DEFAULT buffer backing.
+ * The resource and its requested width, state and flags are created on
+ * demand. Only slices whose VA map belongs to a stable chunk may move. */
+struct vkd3d_buffer_supply
+{
+    pthread_mutex_t lock;
+    pthread_cond_t wake;
+    pthread_t thread;
+    bool enabled, stop, report;
+    unsigned int cursor;
+    uint64_t bytes, hits, misses;
+    struct
+    {
+        struct vkd3d_allocate_heap_memory_info info;
+        struct vkd3d_memory_allocation slots[2];
+        unsigned int seen, count;
+        bool failed;
+    } bins[32];
+};
+void vkd3d_buffer_supply_init(struct d3d12_device *device);
+void vkd3d_buffer_supply_cleanup(struct d3d12_device *device);
+HRESULT vkd3d_allocate_committed_buffer_backing(struct d3d12_device *device,
+        const struct vkd3d_allocate_heap_memory_info *info, struct vkd3d_memory_allocation *allocation);
+
 struct vkd3d_memory_chunk
 {
     struct vkd3d_memory_allocation allocation;
+    bool warm_idle;
     struct vkd3d_memory_free_range *free_ranges;
     size_t free_ranges_size;
     size_t free_ranges_count;
@@ -992,6 +1018,8 @@ bool vkd3d_memory_transfer_queue_clear_in_flight(struct vkd3d_memory_transfer_qu
 struct vkd3d_memory_allocator
 {
     pthread_mutex_t mutex;
+    bool keep_empty_buffers, report_empty_buffers;
+    uint64_t idle_buffer_bytes, reused_empty_buffers;
 
     struct vkd3d_memory_chunk **chunks;
     size_t chunks_size;
@@ -2577,6 +2605,8 @@ struct vkd3d_pipeline_library_disk_cache
     condvar_reltime_t cond;
     pthread_mutex_t lock;
     bool thread_active;
+    bool synchronous_writer;
+    bool write_failed;
 
     struct vkd3d_pipeline_library_disk_cache_item *items;
     size_t items_count;
@@ -2682,6 +2712,7 @@ HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_dis
         struct d3d12_device *device);
 /* Called on device destroy. */
 void vkd3d_pipeline_library_flush_disk_cache(struct vkd3d_pipeline_library_disk_cache *cache);
+HRESULT vkd3d_pipeline_library_commit_disk_cache(struct vkd3d_pipeline_library_disk_cache *cache);
 
 struct vkd3d_buffer
 {
@@ -2761,6 +2792,23 @@ struct d3d12_command_allocator_command_pool
     VkCommandPool vk_command_pool;
     struct d3d12_command_allocator_command_pool_list recycled, pending;
 };
+
+struct d3d12_command_pool_resetter
+{
+    pthread_mutex_t lock;
+    pthread_cond_t wake;
+    pthread_t thread;
+    bool enabled, stop, report;
+    unsigned int cursor;
+    uint64_t exchanges, fresh;
+    struct
+    {
+        enum { POOL_EMPTY, POOL_QUEUED, POOL_RESETTING, POOL_READY } state;
+        struct d3d12_command_allocator_command_pool pool;
+    } slots[8];
+};
+void d3d12_command_pool_resetter_init(struct d3d12_device *device);
+void d3d12_command_pool_resetter_cleanup(struct d3d12_device *device);
 
 struct vkd3d_descriptor_heap_meta_allocation
 {
@@ -5400,6 +5448,7 @@ struct vkd3d_physical_device_info
     VkPhysicalDeviceFragmentShadingRateFeaturesKHR fragment_shading_rate_features;
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric_features_khr;
     VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features;
+    VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR ray_tracing_position_fetch_features;
     VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR compute_shader_derivatives_features_khr;
     VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT shader_image_atomic_int64_features;
     VkPhysicalDeviceImageViewMinLodFeaturesEXT image_view_min_lod_features;
@@ -5915,6 +5964,7 @@ struct d3d12_device
 
     struct vkd3d_memory_transfer_queue memory_transfers;
     struct vkd3d_memory_allocator memory_allocator;
+    struct vkd3d_buffer_supply buffer_supply;
     struct vkd3d_null_rtas_allocation null_rtas_allocation;
 
     struct vkd3d_queue *internal_sparse_queue;
@@ -5927,6 +5977,7 @@ struct d3d12_device
     size_t query_pool_count;
 
     struct vkd3d_cached_command_allocator cached_command_allocators[VKD3D_CACHED_COMMAND_ALLOCATOR_COUNT];
+    struct d3d12_command_pool_resetter pool_resetter;
     size_t cached_command_allocator_count;
 
     uint32_t *descriptor_heap_gpu_vas;

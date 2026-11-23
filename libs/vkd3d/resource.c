@@ -4587,8 +4587,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
             allocate_info.heap_desc.Flags &= ~D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
         }
 
-        if (FAILED(hr = vkd3d_allocate_heap_memory(device,
-                &device->memory_allocator, &allocate_info, &object->mem)))
+        if (FAILED(hr = vkd3d_allocate_committed_buffer_backing(device, &allocate_info, &object->mem)))
             goto fail;
 
         object->res.vk_buffer = object->mem.resource.vk_buffer;

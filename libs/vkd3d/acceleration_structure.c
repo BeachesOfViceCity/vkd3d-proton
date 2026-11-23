@@ -282,6 +282,11 @@ bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
     }
 
     build_info->flags = d3d12_build_flags_to_vk(desc->Flags);
+    /* Opt-in flag for the XS interop caller. Apply the identical flag to
+     * size queries, builds and updates. Regular D3D12 BLASes pay no cost. */
+    if (desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL &&
+            ((uint32_t)desc->Flags & 0x80000000u) && device->device_info.ray_tracing_position_fetch_features.rayTracingPositionFetch)
+        build_info->flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR;
 
     if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE)
     {
@@ -856,4 +861,3 @@ end_unlock:
 end:
     return va;
 }
-
