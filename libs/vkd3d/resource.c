@@ -3352,8 +3352,10 @@ static HRESULT d3d12_resource_validate_usage(const D3D12_RESOURCE_DESC1 *desc,
     if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
             (total_flags & required_image_flags) != required_image_flags)
     {
-        WARN("Requested resource flags #%x, but no format in cast list supports it.\n",
-                desc->Flags);
+        WARN("Requested resource flags #%x, but no format in cast list supports it "
+                "(format %u, dimension %u, %ux%u, required Vulkan usage #%x, supported #%x).\n",
+                desc->Flags, desc->Format, desc->Dimension, (unsigned int)desc->Width, desc->Height,
+                (unsigned int)required_image_flags, (unsigned int)total_flags);
         return E_INVALIDARG;
     }
 
